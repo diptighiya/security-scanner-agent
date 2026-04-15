@@ -31,7 +31,7 @@ from tools.file_tools import (
     find_sensitive_areas,
     find_entry_points,
 )
-from tools.gemini_client import GeminiClient
+from tools.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +42,8 @@ class ReconAgent:
     languages, frameworks, dependencies, and security-sensitive areas.
     """
 
-    def __init__(self, gemini_api_key: str):
-        self.gemini = GeminiClient(gemini_api_key)
+    def __init__(self, gemini_api_key: str, groq_api_key: str = ""):
+        self.llm = LLMClient(gemini_api_key=gemini_api_key, groq_api_key=groq_api_key)
         logger.info("ReconAgent initialized")
 
     def run(self, repo_url: str, existing_repo_path: Optional[str] = None) -> dict:
@@ -206,7 +206,7 @@ Respond ONLY in valid JSON with this structure:
 }}"""
 
         try:
-            return self.gemini.generate_json(prompt)
+            return self.llm.generate_json(prompt)
         except Exception as e:
             logger.warning(f"Gemini enhancement failed: {e}")
             return {

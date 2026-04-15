@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from tools.file_tools import _read_file_safe, get_file_snippets
-from tools.gemini_client import GeminiClient
+from tools.llm_client import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +38,8 @@ class ReportAgent:
     report from vulnerability findings.
     """
 
-    def __init__(self, gemini_api_key: str):
-        self.gemini = GeminiClient(gemini_api_key)
+    def __init__(self, gemini_api_key: str, groq_api_key: str = ""):
+        self.llm = LLMClient(gemini_api_key=gemini_api_key, groq_api_key=groq_api_key)
         logger.info("ReportAgent initialized")
 
     def run(self, analysis_results: dict, output_dir: str = ".") -> str:
@@ -187,7 +187,7 @@ Write in plain English. Do not use bullet points. Do not include the heading "Ex
 Keep it under 400 words. Return plain text only, no JSON."""
 
         try:
-            return self.gemini.generate(prompt)
+            return self.llm.generate(prompt)
         except Exception as e:
             logger.warning(f"Gemini executive summary failed: {e}")
             critical = severity_breakdown.get('critical', 0)
@@ -286,7 +286,7 @@ Respond ONLY in valid JSON:
 }}"""
 
         try:
-            data = self.gemini.generate_json(prompt)
+            data = self.llm.generate_json(prompt)
             finding["explanation"] = data.get("explanation", finding.get("description", ""))
             finding["fixed_code_snippet"] = data.get("fixed_code_snippet", "")
             finding["remediation_hint"] = data.get("remediation_principle", "")
@@ -324,7 +324,7 @@ Example format: ["Immediately patch all SQL injection vulnerabilities by using p
 Respond ONLY with a valid JSON array of strings."""
 
         try:
-            steps = self.gemini.generate_json(prompt)
+            steps = self.llm.generate_json(prompt)
             if isinstance(steps, list):
                 return [str(s) for s in steps]
         except Exception as e:

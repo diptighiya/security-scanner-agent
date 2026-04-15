@@ -93,13 +93,15 @@ Examples:
         logger.error("Invalid repository URL. Must start with https:// or git@")
         sys.exit(1)
 
-    # Get API key
+    # Get API keys
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     if not gemini_api_key:
         logger.error(
             "GEMINI_API_KEY not found. Set it in your .env file or as an environment variable."
         )
         sys.exit(1)
+
+    groq_api_key = os.getenv("GROQ_API_KEY", "")
 
     # Ensure output directory exists
     output_dir = Path(args.output_dir)
@@ -118,6 +120,7 @@ Examples:
 
     pipeline = SecurityScannerPipeline(
         gemini_api_key=gemini_api_key,
+        groq_api_key=groq_api_key,
         output_dir=str(output_dir),
         save_intermediates=not args.no_intermediates,
     )

@@ -26,16 +26,19 @@ class SecurityScannerPipeline:
     def __init__(
         self,
         gemini_api_key: str,
+        groq_api_key: str = "",
         output_dir: str = ".",
         save_intermediates: bool = True,
     ):
         """
         Args:
             gemini_api_key: Google Gemini API key.
+            groq_api_key: Groq API key (used as fallback/round-robin).
             output_dir: Directory where reports and intermediate JSON are saved.
             save_intermediates: Whether to save intermediate JSON outputs per agent.
         """
         self.gemini_api_key = gemini_api_key
+        self.groq_api_key = groq_api_key
         self.output_dir = output_dir
         self.save_intermediates = save_intermediates
 
@@ -44,9 +47,9 @@ class SecurityScannerPipeline:
         from agents.vulnerability_agent import VulnerabilityAgent
         from agents.report_agent import ReportAgent
 
-        self.recon_agent = ReconAgent(gemini_api_key)
-        self.vulnerability_agent = VulnerabilityAgent(gemini_api_key)
-        self.report_agent = ReportAgent(gemini_api_key)
+        self.recon_agent = ReconAgent(gemini_api_key, groq_api_key)
+        self.vulnerability_agent = VulnerabilityAgent(gemini_api_key, groq_api_key)
+        self.report_agent = ReportAgent(gemini_api_key, groq_api_key)
 
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
