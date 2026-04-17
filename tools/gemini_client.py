@@ -1,15 +1,20 @@
 """
-Gemini REST API client — calls the Gemini 2.0 Flash model directly
-via HTTP so we don't depend on any specific version of the SDK.
+Gemini LangChain wrapper — exposes ChatGoogleGemini as a LangChain BaseChatModel
+by wrapping the REST API, since langchain-google-genai is unavailable in this env.
 """
+
+from __future__ import annotations
 
 import json
 import logging
 import re
 import time
-from typing import Optional
+from typing import Any, List, Optional
 
 import requests
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 
 logger = logging.getLogger(__name__)
 
@@ -18,134 +23,130 @@ GEMINI_API_URL = (
     "gemini-2.0-flash:generateContent"
 )
 
-_DEFAULT_GENERATION_CONFIG = {
+_GENERATION_CONFIG = {
     "temperature": 0.2,
     "topP": 0.8,
     "topK": 40,
     "maxOutputTokens": 8192,
 }
 
+_SAFETY_SETTINGS = [
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+]
 
-class GeminiClient:
-    """Thin wrapper around the Gemini REST API with exponential backoff."""
 
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
-        # Track last request time to enforce minimum spacing
-        self._last_request_time = 0.0
-        self._min_request_interval = 4.0  # seconds between requests (free tier: 15 RPM)
+class ChatGoogleGemini(BaseChatModel):
+    """
+    LangChain-compatible ChatModel backed by the Gemini REST API.
+    Implements BaseChatModel so it integrates with .with_fallbacks(),
+    LCEL chains, and all other LangChain primitives.
+    """
 
-    def generate(
+    api_key: str
+    model: str = "gemini-2.0-flash"
+    max_retries: int = 2
+    base_retry_delay: float = 5.0
+    min_request_interval: float = 4.0
+
+    # Internal mutable state stored outside pydantic fields
+    _session: Optional[requests.Session] = None
+    _last_request_time: float = 0.0
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    @property
+    def _llm_type(self) -> str:
+        return "google-gemini"
+
+    def _get_session(self) -> requests.Session:
+        if self._session is None:
+            self._session = requests.Session()
+            self._session.headers.update({"Content-Type": "application/json"})
+        return self._session
+
+    def _generate(
         self,
-        prompt: str,
-        max_retries: int = 5,
-        base_retry_delay: float = 15.0,
-    ) -> str:
-        """
-        Send a text prompt to Gemini and return the response text.
-        Uses exponential backoff on 429 rate-limit responses.
+        messages: List[BaseMessage],
+        stop: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        prompt = "\n\n".join(str(m.content) for m in messages if hasattr(m, "content"))
+        text = self._call_api(prompt)
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content=text))])
 
-        Raises:
-            RuntimeError: if all retries are exhausted.
-        """
+    def _call_api(self, prompt: str) -> str:
+        """Call Gemini REST API with retry and rate-limit backoff."""
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": _DEFAULT_GENERATION_CONFIG,
-            "safetySettings": [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            ],
+            "generationConfig": _GENERATION_CONFIG,
+            "safetySettings": _SAFETY_SETTINGS,
         }
-
         url = f"{GEMINI_API_URL}?key={self.api_key}"
+        session = self._get_session()
 
-        for attempt in range(1, max_retries + 1):
-            # Enforce minimum spacing between requests
+        for attempt in range(1, self.max_retries + 1):
             elapsed = time.time() - self._last_request_time
-            if elapsed < self._min_request_interval:
-                time.sleep(self._min_request_interval - elapsed)
+            if elapsed < self.min_request_interval:
+                time.sleep(self.min_request_interval - elapsed)
 
-            try:
-                self._last_request_time = time.time()
-                response = self.session.post(url, json=payload, timeout=120)
+            self._last_request_time = time.time()
+            response = session.post(url, json=payload, timeout=120)
 
-                # Extract status before raise_for_status so we can inspect it
-                status_code = response.status_code
+            if response.status_code == 429:
+                wait = self.base_retry_delay * (2 ** (attempt - 1))
+                logger.warning("[Gemini] Rate limited. Waiting %.0fs (attempt %d/%d)", wait, attempt, self.max_retries)
+                time.sleep(wait)
+                if attempt == self.max_retries:
+                    raise ValueError(f"Gemini rate limited (429) after {self.max_retries} retries")
+                continue
 
-                if status_code == 429:
-                    # Exponential backoff: 15s, 30s, 60s, 120s, 240s
-                    wait = base_retry_delay * (2 ** (attempt - 1))
-                    logger.warning(
-                        f"[Gemini] Rate limited (429). Waiting {wait:.0f}s "
-                        f"before retry {attempt}/{max_retries}..."
-                    )
-                    time.sleep(wait)
-                    continue
+            if response.status_code in (500, 502, 503, 504):
+                time.sleep(self.base_retry_delay)
+                continue
 
-                if status_code in (500, 502, 503, 504):
-                    wait = base_retry_delay
-                    logger.warning(
-                        f"[Gemini] Server error {status_code}. Waiting {wait}s "
-                        f"before retry {attempt}/{max_retries}..."
-                    )
-                    time.sleep(wait)
-                    continue
+            response.raise_for_status()
+            data = response.json()
+            return self._extract_text(data)
 
-                response.raise_for_status()
-                data = response.json()
-                return self._extract_text(data)
-
-            except requests.exceptions.HTTPError as e:
-                # Catch any remaining HTTP errors not handled above
-                logger.error(f"[Gemini] HTTP error on attempt {attempt}: {e}")
-                if attempt >= max_retries:
-                    raise RuntimeError(f"Gemini API HTTP error: {e}") from e
-                time.sleep(base_retry_delay)
-
-            except requests.exceptions.Timeout:
-                logger.warning(f"[Gemini] Request timed out (attempt {attempt}/{max_retries})")
-                if attempt < max_retries:
-                    time.sleep(base_retry_delay)
-
-            except Exception as e:
-                logger.error(f"[Gemini] Unexpected error: {e}")
-                raise RuntimeError(f"Gemini request failed: {e}") from e
-
-        raise RuntimeError(f"Gemini API failed after {max_retries} retries")
-
-    def generate_json(self, prompt: str, max_retries: int = 5) -> any:
-        """
-        Generate a response and parse it as JSON.
-        Strips markdown code fences before parsing.
-        """
-        text = self.generate(prompt, max_retries=max_retries)
-        return parse_json_response(text)
+        raise ValueError(f"Gemini API failed after {self.max_retries} retries")
 
     @staticmethod
     def _extract_text(data: dict) -> str:
-        """Extract text content from Gemini API response."""
-        try:
-            candidates = data.get("candidates", [])
-            if not candidates:
-                feedback = data.get("promptFeedback", {})
-                block_reason = feedback.get("blockReason")
-                if block_reason:
-                    raise RuntimeError(f"Gemini blocked the request: {block_reason}")
-                return ""
-            candidate = candidates[0]
-            content = candidate.get("content", {})
-            parts = content.get("parts", [])
-            return "".join(part.get("text", "") for part in parts)
-        except (KeyError, IndexError) as e:
-            raise RuntimeError(f"Unexpected Gemini response structure: {e}") from e
+        candidates = data.get("candidates", [])
+        if not candidates:
+            block = data.get("promptFeedback", {}).get("blockReason")
+            if block:
+                raise ValueError(f"Gemini blocked: {block}")
+            return ""
+        parts = candidates[0].get("content", {}).get("parts", [])
+        return "".join(p.get("text", "") for p in parts)
 
 
-def parse_json_response(text: str) -> any:
-    """Strip markdown fences and parse JSON."""
+# ---------------------------------------------------------------------------
+# Convenience alias kept for any code that still does:
+#   from tools.gemini_client import GeminiClient
+# ---------------------------------------------------------------------------
+class GeminiClient:
+    """Legacy thin wrapper — delegates to ChatGoogleGemini internally."""
+
+    def __init__(self, api_key: str):
+        self._model = ChatGoogleGemini(api_key=api_key)
+
+    def generate(self, prompt: str, **kwargs) -> str:
+        from langchain_core.messages import HumanMessage
+        result = self._model._generate([HumanMessage(content=prompt)])
+        return result.generations[0].message.content
+
+    def generate_json(self, prompt: str, **kwargs) -> Any:
+        text = self.generate(prompt)
+        return _parse_json(text)
+
+
+def _parse_json(text: str) -> Any:
     text = text.strip()
     text = re.sub(r"^```[a-z]*\n?", "", text)
     text = re.sub(r"\n?```$", "", text.strip())

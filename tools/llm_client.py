@@ -1,6 +1,13 @@
 """
-Unified LLM client — round-robin between Gemini and Groq with
-automatic fallback when one provider is rate-limited.
+Unified LangChain LLM client — round-robin between Gemini and Groq
+using LangChain's .with_fallbacks() for automatic failover.
+
+Architecture:
+  - Primary:  ChatGoogleGemini  (custom BaseChatModel wrapping REST API)
+  - Fallback: ChatGroq          (via langchain-groq)
+  - Chain:    primary.with_fallbacks([fallback]) | OutputParser
+  - Parsers:  StrOutputParser for text, _SafeJsonOutputParser for structured data
+  - Template: ChatPromptTemplate with a single {prompt} variable
 
 Usage:
     from tools.llm_client import LLMClient
@@ -15,114 +22,112 @@ import json
 import logging
 import re
 import time
-from typing import Optional
+from typing import Any
+
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
+from tools.gemini_client import ChatGoogleGemini
+from tools.groq_client import build_groq_chat_model
 
 logger = logging.getLogger(__name__)
 
-# How long to wait (seconds) when BOTH providers are rate-limited
-BOTH_LIMITED_WAIT = 10.0
-# How many times to retry when both are simultaneously limited
-BOTH_LIMITED_MAX_CYCLES = 6
+BOTH_EXHAUSTED_WAIT = 15.0
+BOTH_EXHAUSTED_MAX_CYCLES = 4
 
 
 class LLMClient:
     """
-    Unified LLM client that alternates between Gemini and Groq.
+    Unified client powered by LangChain LCEL chains.
 
-    Call order: Gemini → Groq → Gemini → Groq → ...
-    On a 429 from either provider, switches to the other.
-    If both are rate-limited simultaneously, waits and retries.
+    Uses ChatGoogleGemini as the primary model and ChatGroq as the
+    automatic fallback via LangChain's .with_fallbacks(). Both are
+    wired into a ChatPromptTemplate | LLM | OutputParser pipeline.
     """
 
     def __init__(self, gemini_api_key: str, groq_api_key: str):
-        from tools.gemini_client import GeminiClient
-        from tools.groq_client import GroqClient
+        gemini = ChatGoogleGemini(api_key=gemini_api_key)
+        groq = build_groq_chat_model(groq_api_key)
 
-        self._gemini = GeminiClient(gemini_api_key)
-        self._groq = GroqClient(groq_api_key)
+        # LangChain .with_fallbacks() — if Gemini raises any exception,
+        # LangChain automatically retries with Groq
+        llm_with_fallback = gemini.with_fallbacks(
+            [groq],
+            exceptions_to_handle=(Exception,),
+        )
 
-        # 0 = Gemini next, 1 = Groq next
-        self._turn = 0
-        self._providers = ["Gemini", "Groq"]
+        # Shared prompt template — single {prompt} variable
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("human", "{prompt}"),
+        ])
 
-        logger.info("LLMClient initialized (round-robin: Gemini ↔ Groq)")
+        # LCEL pipelines:  template | llm_with_fallback | parser
+        self._text_pipeline = prompt_template | llm_with_fallback | StrOutputParser()
+        self._json_pipeline = prompt_template | llm_with_fallback | _SafeJsonOutputParser()
+
+        logger.info("LLMClient initialized (LangChain LCEL: Gemini → Groq fallback)")
 
     def generate(self, prompt: str) -> str:
         """
-        Send prompt to whichever provider is next in round-robin.
-        Automatically falls back to the other on 429.
-        If both are rate-limited, waits and retries up to BOTH_LIMITED_MAX_CYCLES times.
+        Invoke the text pipeline. Gemini is tried first; LangChain automatically
+        falls back to Groq on any exception (including 429 rate limits).
         """
-        for cycle in range(BOTH_LIMITED_MAX_CYCLES):
-            primary = self._turn
-            fallback = 1 - primary
+        for cycle in range(1, BOTH_EXHAUSTED_MAX_CYCLES + 1):
+            try:
+                logger.info("[LLMClient] Invoking text pipeline")
+                return self._text_pipeline.invoke({"prompt": prompt})
+            except Exception as e:
+                if _is_rate_limit(e):
+                    wait = BOTH_EXHAUSTED_WAIT * cycle
+                    logger.warning(
+                        "[LLMClient] Both providers rate-limited. Waiting %.0fs (cycle %d/%d)",
+                        wait, cycle, BOTH_EXHAUSTED_MAX_CYCLES,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise RuntimeError(f"LLM generation failed: {e}") from e
 
-            # Try primary
-            result = self._try_provider(primary, prompt)
-            if result is not None:
-                self._turn = fallback  # advance round-robin
-                return result
+        raise RuntimeError("Both Gemini and Groq exhausted all retries.")
 
-            logger.warning(
-                "[LLMClient] %s rate-limited. Switching to %s...",
-                self._providers[primary], self._providers[fallback],
-            )
-
-            # Try fallback
-            result = self._try_provider(fallback, prompt)
-            if result is not None:
-                self._turn = primary  # keep same turn (fallback used this round)
-                return result
-
-            # Both limited
-            wait = BOTH_LIMITED_WAIT * (cycle + 1)
-            logger.warning(
-                "[LLMClient] Both providers rate-limited. Waiting %.0fs (cycle %d/%d)...",
-                wait, cycle + 1, BOTH_LIMITED_MAX_CYCLES,
-            )
-            time.sleep(wait)
-
-        raise RuntimeError(
-            f"Both Gemini and Groq are rate-limited after {BOTH_LIMITED_MAX_CYCLES} cycles."
-        )
-
-    def generate_json(self, prompt: str) -> any:
-        """Generate a response and parse it as JSON."""
-        text = self.generate(prompt)
-        return _parse_json_response(text)
-
-    def _try_provider(self, provider_index: int, prompt: str) -> Optional[str]:
+    def generate_json(self, prompt: str) -> Any:
         """
-        Attempt a single generation with the specified provider.
-        Returns the text on success, or None if rate-limited.
-        Raises RuntimeError on non-rate-limit failures.
+        Invoke the JSON pipeline. Uses _SafeJsonOutputParser which strips
+        markdown fences before parsing, handling both Gemini and Groq output styles.
         """
-        provider_name = self._providers[provider_index]
-        logger.info("[LLMClient] Using provider: %s", provider_name)
+        for cycle in range(1, BOTH_EXHAUSTED_MAX_CYCLES + 1):
+            try:
+                logger.info("[LLMClient] Invoking JSON pipeline")
+                return self._json_pipeline.invoke({"prompt": prompt})
+            except json.JSONDecodeError:
+                raise  # Malformed JSON — not a rate limit, propagate
+            except Exception as e:
+                if _is_rate_limit(e):
+                    wait = BOTH_EXHAUSTED_WAIT * cycle
+                    logger.warning(
+                        "[LLMClient] Both providers rate-limited. Waiting %.0fs (cycle %d/%d)",
+                        wait, cycle, BOTH_EXHAUSTED_MAX_CYCLES,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise RuntimeError(f"LLM JSON generation failed: {e}") from e
 
-        try:
-            if provider_index == 0:
-                return self._gemini.generate(prompt, max_retries=1, base_retry_delay=5.0)
-            else:
-                return self._groq.generate(prompt, max_retries=1, base_retry_delay=5.0)
-
-        except RuntimeError as e:
-            msg = str(e).lower()
-            if "429" in msg or "rate limit" in msg or "rate-limit" in msg or "failed after" in msg:
-                return None  # Signal to try the other provider
-            raise  # Non-rate-limit error — propagate
-
-        except Exception as e:
-            # Check if it's a rate limit wrapped in another exception type
-            msg = str(e).lower()
-            if "429" in msg or "rate limit" in msg:
-                return None
-            raise RuntimeError(f"{provider_name} error: {e}") from e
+        raise RuntimeError("Both Gemini and Groq exhausted all retries.")
 
 
-def _parse_json_response(text: str) -> any:
-    """Strip markdown fences and parse JSON."""
-    text = text.strip()
-    text = re.sub(r"^```[a-z]*\n?", "", text)
-    text = re.sub(r"\n?```$", "", text.strip())
-    return json.loads(text)
+class _SafeJsonOutputParser(JsonOutputParser):
+    """
+    Extends LangChain's JsonOutputParser to strip markdown code fences
+    (```json ... ```) before parsing — both Gemini and Groq often emit these.
+    """
+
+    def parse(self, text: str) -> Any:
+        text = text.strip()
+        text = re.sub(r"^```[a-z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text.strip())
+        return json.loads(text)
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    """Return True if the exception looks like a rate-limit error."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in ("rate", "429", "limit", "quota", "exhausted"))
